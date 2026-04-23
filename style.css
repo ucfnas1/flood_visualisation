@@ -31,9 +31,9 @@ html, body {
 }
 
 .page {
-  max-width: 1280px;
+  max-width: 1600px;
   margin: 0 auto;
-  padding: 48px 32px 64px;
+  padding: 36px 18px 56px;
 }
 
 .page-header {
@@ -191,7 +191,7 @@ html, body {
 
 @media (max-width: 860px) {
   .chart-grid { grid-template-columns: 1fr; }
-  .page { padding: 32px 18px 48px; }
+  .page { padding: 24px 12px 40px; }
 }
 
 .panel {
