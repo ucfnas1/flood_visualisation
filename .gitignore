@@ -1,0 +1,14 @@
+# Raw / unsimplified UK LAD geojson is ~331 MB — exceeds GitHub's 100 MB limit.
+# The site loads the simplified version (data/uk_flood_frequency_simplified.geojson, ~2.6 MB)
+# generated via:
+#   npx mapshaper data/uk_flood_frequency_countpolygon.geojson \
+#     -simplify 1.5% keep-shapes -o uk_flood_frequency_simplified.geojson
+data/uk_flood_frequency_countpolygon.geojson
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/

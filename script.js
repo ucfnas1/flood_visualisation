@@ -18,8 +18,18 @@
   };
   const SEASON_ORDER = ["Spring", "Summer", "Autumn", "Winter", "Unknown"];
 
+  const MAP_GEOJSON = "data/uk_flood_frequency_simplified.geojson";
+  const MAP_NAME_FIELD = "LAD25NM";
+  const MAP_COUNT_FIELD = "polygon_count";
+
   const tooltip = document.getElementById("tooltip");
   const errorBanner = document.getElementById("error-banner");
+
+  // Kick off the choropleth map (independent of the temporal charts).
+  initHeroMap();
+
+  // Section 03 — city tab interactions (placeholder for now).
+  initHousingCityTabs();
 
   d3.csv(CSV_PATH, rowParser)
     .then((rows) => {
@@ -341,7 +351,7 @@
   }
 
   function hideTooltip() {
-    tooltip.classList.remove("visible");
+    tooltip.classList.remove("visible", "is-map");
     tooltip.setAttribute("aria-hidden", "true");
   }
 
@@ -367,6 +377,323 @@
     return (...args) => {
       clearTimeout(t);
       t = setTimeout(() => fn(...args), wait);
+    };
+  }
+
+  /* ----------------------------------------------------
+     HERO CHOROPLETH MAP
+     ---------------------------------------------------- */
+
+  async function initHeroMap() {
+    const container = document.getElementById("map-container");
+    const loading = document.getElementById("map-loading");
+    if (!container) return;
+
+    let geo;
+    try {
+      geo = await d3.json(MAP_GEOJSON);
+    } catch (err) {
+      console.error("Failed to load UK flood frequency map:", err);
+      if (loading) loading.textContent = "Map data unavailable";
+      return;
+    }
+
+    // Pre-correct longitudes by cos(central UK latitude) so the flat
+    // identity projection renders the UK with realistic proportions
+    // (counters lon-degree distortion at ~55°N).
+    geo = adjustForUKAspect(geo, 54.5);
+
+    const counts = geo.features.map(
+      (f) => +f.properties[MAP_COUNT_FIELD] || 0
+    );
+    const nonZero = counts.filter((c) => c > 0).sort(d3.ascending);
+    const maxCount = d3.max(counts) || 1;
+
+    // 7-class quantile scale on non-zero values → highlights the skew.
+    const palette = d3.schemeBlues[7];
+    const quantiles = [];
+    for (let i = 1; i < 7; i++) {
+      quantiles.push(d3.quantileSorted(nonZero, i / 7));
+    }
+    const classify = (value) => {
+      if (!value || value <= 0) return 0;
+      for (let i = 0; i < quantiles.length; i++) {
+        if (value <= quantiles[i]) return i + 1;
+      }
+      return 6;
+    };
+    const fillFor = (value) =>
+      value == null || value <= 0 ? "#e6ecef" : palette[classify(value)];
+
+    const svg = d3
+      .select(container)
+      .append("svg")
+      .attr("role", "img")
+      .attr("aria-label", "UK choropleth of recorded flood outlines by local authority");
+
+    const viewGroup = svg.append("g").attr("class", "map-view");
+    const pathsGroup = viewGroup.append("g").attr("class", "map-paths");
+
+    const pathGen = d3.geoPath();
+    let projection;
+    let currentDims = { width: 0, height: 0 };
+
+    function sizeAndProject() {
+      const rect = container.getBoundingClientRect();
+      const width = Math.max(200, rect.width);
+      const height = Math.max(200, rect.height);
+      currentDims = { width, height };
+
+      svg.attr("viewBox", `0 0 ${width} ${height}`);
+
+      // Use geoIdentity for UK-scale data — avoids the spherical-clip
+      // artifacts that geoMercator adds around each feature.
+      projection = d3.geoIdentity().reflectY(true).fitSize([width, height], geo);
+      pathGen.projection(projection);
+
+      pathsGroup.selectAll("path.la-path").attr("d", pathGen);
+    }
+
+    // Initial paths
+    pathsGroup
+      .selectAll("path.la-path")
+      .data(geo.features, (d) => d.properties[MAP_NAME_FIELD])
+      .enter()
+      .append("path")
+      .attr("class", "la-path")
+      .attr("fill", (d) => fillFor(+d.properties[MAP_COUNT_FIELD]))
+      .on("mouseenter", function (event, d) {
+        d3.select(this).raise().classed("is-active", true);
+        showMapTooltip(event, d);
+      })
+      .on("mousemove", (event) => positionTooltip(event))
+      .on("mouseleave", function () {
+        d3.select(this).classed("is-active", false);
+        hideTooltip();
+      })
+      .on("click", function (event, d) {
+        event.stopPropagation();
+        zoomToFeature(d);
+      });
+
+    sizeAndProject();
+
+    // Zoom behaviour
+    const zoom = d3
+      .zoom()
+      .scaleExtent([1, 20])
+      .on("zoom", (event) => {
+        viewGroup.attr("transform", event.transform);
+        pathsGroup.selectAll("path.la-path").attr("stroke-width", 0.35 / event.transform.k);
+      });
+
+    svg.call(zoom);
+    svg.on("dblclick.zoom", null); // disable d3-zoom's default dblclick-zoom
+
+    function zoomToFeature(feature) {
+      const [[x0, y0], [x1, y1]] = pathGen.bounds(feature);
+      const dx = x1 - x0;
+      const dy = y1 - y0;
+      const { width, height } = currentDims;
+      const scale = Math.min(
+        12,
+        0.85 / Math.max(dx / width, dy / height)
+      );
+      const tx = (width - scale * (x0 + x1)) / 2;
+      const ty = (height - scale * (y0 + y1)) / 2;
+      svg
+        .transition()
+        .duration(750)
+        .ease(d3.easeCubicInOut)
+        .call(
+          zoom.transform,
+          d3.zoomIdentity.translate(tx, ty).scale(scale)
+        );
+    }
+
+    svg.on("dblclick", (event) => {
+      // Only reset when double-click lands on empty background (no LA path).
+      if (event.target && event.target.classList.contains("la-path")) return;
+      svg
+        .transition()
+        .duration(600)
+        .ease(d3.easeCubicInOut)
+        .call(zoom.transform, d3.zoomIdentity);
+    });
+
+    // Legend
+    renderMapLegend(quantiles, palette, maxCount);
+
+    // Responsive re-projection
+    const onResize = debounce(() => {
+      sizeAndProject();
+      svg.call(zoom.transform, d3.zoomIdentity);
+    }, 150);
+    window.addEventListener("resize", onResize);
+
+    // Hide loading overlay
+    if (loading) {
+      requestAnimationFrame(() => loading.classList.add("is-hidden"));
+      setTimeout(() => loading.remove(), 700);
+    }
+  }
+
+  function renderMapLegend(quantiles, palette, maxCount) {
+    const legend = d3.select("#map-legend");
+    if (legend.empty()) return;
+    legend.selectAll("*").remove();
+
+    legend
+      .append("span")
+      .attr("class", "legend-title")
+      .text("Number of Recorded Flood Outlines");
+
+    // "No record" swatch
+    const zeroItem = legend.append("span").attr("class", "legend-bucket");
+    zeroItem
+      .append("span")
+      .attr("class", "legend-bucket-swatch")
+      .style("background", "#e6ecef");
+    zeroItem.append("span").text("0");
+
+    const edges = [0, ...quantiles.map((q) => Math.round(q)), Math.round(maxCount)];
+    for (let i = 1; i < edges.length; i++) {
+      const lo = edges[i - 1] + (i === 1 ? 1 : 1);
+      const hi = edges[i];
+      const label = lo >= hi ? `${hi}` : `${lo}–${hi}`;
+      const item = legend.append("span").attr("class", "legend-bucket");
+      item
+        .append("span")
+        .attr("class", "legend-bucket-swatch")
+        .style("background", palette[i - 1]);
+      item.append("span").text(label);
+    }
+  }
+
+  function showMapTooltip(event, feature) {
+    const name = feature.properties[MAP_NAME_FIELD] || "Unknown";
+    const count = +feature.properties[MAP_COUNT_FIELD] || 0;
+    tooltip.innerHTML = `
+      <div class="tt-header">${name}</div>
+      <div class="tt-map-stat">
+        <span class="tt-map-label">Recorded flood outlines</span>
+        <span class="tt-map-value">${count.toLocaleString()}</span>
+      </div>
+    `;
+    tooltip.classList.add("visible", "is-map");
+    tooltip.setAttribute("aria-hidden", "false");
+    positionTooltip(event);
+  }
+
+  /* ----------------------------------------------------
+     SECTION 03 — CITY TABS
+     ---------------------------------------------------- */
+
+  function initHousingCityTabs() {
+    const tabs = document.querySelectorAll(".city-tab");
+    if (!tabs.length) return;
+    const selectedLabel = document.getElementById("housing-selected-city");
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", () => {
+        tabs.forEach((t) => {
+          t.classList.remove("is-active");
+          t.setAttribute("aria-selected", "false");
+        });
+        tab.classList.add("is-active");
+        tab.setAttribute("aria-selected", "true");
+        if (selectedLabel) {
+          selectedLabel.textContent = tab.dataset.city || "";
+        }
+      });
+    });
+  }
+
+  /* ----------------------------------------------------
+     HERO LEFT — EVENT HISTORY BROWSER
+     ---------------------------------------------------- */
+
+  function renderEventHistory(rows) {
+    const list = document.getElementById("event-history-list");
+    if (!list) return;
+
+    // De-duplicate by rec_grp_id and sort most-recent-first.
+    const seen = new Set();
+    const sorted = rows
+      .slice()
+      .sort((a, b) => {
+        const da = a.fxg_start_date || "";
+        const db = b.fxg_start_date || "";
+        if (db !== da) return db.localeCompare(da);
+        return (b.fxg_year || 0) - (a.fxg_year || 0);
+      });
+
+    const unique = [];
+    for (const r of sorted) {
+      if (!r.rec_grp_id || seen.has(r.rec_grp_id)) continue;
+      seen.add(r.rec_grp_id);
+      unique.push(r);
+    }
+
+    if (!unique.length) {
+      list.innerHTML = `<li class="history-item history-item-empty">No events to display.</li>`;
+      return;
+    }
+
+    list.innerHTML = unique
+      .map((r) => {
+        const cityName = CITY_DISPLAY[r.city] || r.city || "";
+        const season = r.fxg_season || "Unknown";
+        const seasonColor = SEASON_COLOUR[season] || SEASON_COLOUR.Unknown;
+        const src =
+          r.fxg_flood_src && r.fxg_flood_src.toLowerCase() !== "unknown"
+            ? r.fxg_flood_src
+            : "";
+        const meta = [cityName, season, src].filter(Boolean).join(" · ");
+        const name = r.fxg_name && r.fxg_name.trim()
+          ? r.fxg_name
+          : `${cityName} flood event`;
+        return `
+          <li class="history-item" data-year="${r.fxg_year}">
+            <span class="history-marker" style="background:${seasonColor}" aria-hidden="true"></span>
+            <span class="history-year">${r.fxg_year}</span>
+            <div class="history-body">
+              <p class="history-text">${escapeHtml(name)}</p>
+              <p class="history-meta">${escapeHtml(meta)}</p>
+            </div>
+          </li>
+        `;
+      })
+      .join("");
+  }
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    })[c]);
+  }
+
+  function adjustForUKAspect(geojson, centralLat) {
+    const k = Math.cos((centralLat * Math.PI) / 180);
+    function transformCoords(coords) {
+      if (typeof coords[0] === "number") {
+        return [coords[0] * k, coords[1]];
+      }
+      return coords.map(transformCoords);
+    }
+    return {
+      type: "FeatureCollection",
+      features: geojson.features.map((f) => ({
+        type: "Feature",
+        properties: f.properties,
+        geometry: {
+          type: f.geometry.type,
+          coordinates: transformCoords(f.geometry.coordinates),
+        },
+      })),
     };
   }
 })();
